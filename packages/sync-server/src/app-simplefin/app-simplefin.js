@@ -6,6 +6,7 @@ import {
   requestLoggerMiddleware,
   validateSessionMiddleware,
 } from '#util/middlewares';
+import { isValidFileId } from '#util/paths';
 import { assertUrlAllowed } from '#util/ssrf';
 
 const app = express();
@@ -14,10 +15,62 @@ app.use(requestLoggerMiddleware);
 app.use(express.json());
 app.use(validateSessionMiddleware);
 
+/**
+ * Checks if a user can access a file.
+ * @param {*} fileId The active budget file ID, or null for global credentials.
+ * @param {*} userId The user ID.
+ * @returns {boolean} True if the user can access the file, false otherwise.
+ */
+function canAccessFile(fileId, userId) {
+  return isAdmin(userId) || UserService.countUserAccess(fileId, userId) > 0;
+}
+
+/**
+ * Checks if a file has credentials.
+ * @param {*} fileId The active budget file ID, or null for global credentials.
+ * @returns {boolean} True if the file has credentials, false otherwise.
+ */
+function hasCredentials(fileId = null) {
+  return !!(
+    secretsService.get(SecretName.simplefin_accessKey, fileId) &&
+    secretsService.get(SecretName.simplefin_token, fileId)
+  );
+}
+
+/**
+ * Gets the credential source based on the file ID.
+ * @param {*} fileId The active budget file ID, or null for global credentials.
+ * @returns {string|null} 'per-budget-file' if the file ID has credentials, 'global' if global credentials exist, or null if no credentials are found.
+ */
+function getCredentialSource(fileId) {
+  if (!!fileId && hasCredentials(fileId)) {
+    return 'per-budget-file';
+  }
+
+  if (hasCredentials()) {
+    return 'global';
+  }
+
+  return null;
+}
+
 app.post(
   '/status',
   handleError(async (req, res) => {
-    const token = secretsService.get(SecretName.simplefin_token);
+    const fileId = req.get('X-Actual-File-Id');
+    if (!!fileId) {
+      if (!isValidFileId(fileId)) {
+        invalidFileId(res);
+        return;
+      }
+
+      if (!canAccessFile(fileId, res.locals.user_id)) {
+        fileAccessDenied(res);
+        return;
+      }
+    }
+
+    const token = secretsService.get(SecretName.simplefin_token, fileId);
     const configured = token != null && !isForbidden(token);
 
     res.send({
@@ -32,11 +85,24 @@ app.post(
 app.post(
   '/accounts',
   handleError(async (req, res) => {
-    let accessKey = secretsService.get(SecretName.simplefin_accessKey);
+    const fileId = req.get('X-Actual-File-Id');
+    if (!!fileId) {
+      if (!isValidFileId(fileId)) {
+        invalidFileId(res);
+        return;
+      }
+
+      if (!canAccessFile(fileId, res.locals.user_id)) {
+        fileAccessDenied(res);
+        return;
+      }
+    }
+
+    let accessKey = secretsService.get(SecretName.simplefin_accessKey, fileId);
 
     try {
       if (isInvalidAccessKey(accessKey)) {
-        const token = secretsService.get(SecretName.simplefin_token);
+        const token = secretsService.get(SecretName.simplefin_token, fileId);
         if (token == null || isForbidden(token)) {
           throw new Error('No token');
         } else {
@@ -44,7 +110,7 @@ app.post(
           if (isInvalidAccessKey(accessKey)) {
             throw new Error('No access key');
           }
-          secretsService.set(SecretName.simplefin_accessKey, accessKey);
+          secretsService.set(SecretName.simplefin_accessKey, accessKey, fileId);
         }
       }
     } catch {
@@ -73,7 +139,28 @@ app.post(
   handleError(async (req, res) => {
     const { accountId, startDate } = req.body || {};
 
-    const accessKey = secretsService.get(SecretName.simplefin_accessKey);
+    const fileId = req.get('X-Actual-File-Id');
+    if (!!fileId) {
+      if (!isValidFileId(fileId)) {
+        res.status(400).send({
+          status: 'error',
+          reason: 'invalid-file-id',
+          details: 'invalid fileId',
+        });
+        return;
+      }
+
+      if (!canAccessFile(fileId, res.locals.user_id)) {
+        res.status(403).send({
+          status: 'error',
+          reason: 'file-access-denied',
+          details: "You don't have permissions over this file",
+        });
+        return;
+      }
+    }
+
+    const accessKey = secretsService.get(SecretName.simplefin_accessKey, fileId);
 
     if (isInvalidAccessKey(accessKey)) {
       invalidToken(res);
@@ -272,6 +359,30 @@ function invalidToken(res) {
       status: 'rejected',
       reason:
         'Invalid SimpleFIN access token.  Reset the token and re-link any broken accounts.',
+    },
+  });
+}
+
+function invalidFileId(res) {
+  res.send({
+    status: 'ok',
+    data: {
+      error_type: 'INVALID_FILE_ID',
+      error_code: 'INVALID_FILE_ID',
+      status: 'rejected',
+      reason: 'Invalid budget file ID sent in X-Actual-File-Id header.',
+    },
+  });
+}
+
+function fileAccessDenied(res) {
+  res.status(403).send({
+    status: 'ok',
+    data: {
+      error_type: 'FILE_ACCESS_DENIED',
+      error_code: 'FILE_ACCESS_DENIED',
+      status: 'rejected',
+      reason: "You don't have permissions over this file.",
     },
   });
 }
